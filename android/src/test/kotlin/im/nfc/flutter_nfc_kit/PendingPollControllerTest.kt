@@ -26,8 +26,8 @@ class PendingPollControllerTest {
         val controller = PendingPollController<String>()
         controller.begin("poll")
 
-        assertEquals("poll", controller.takeCurrent())
-        assertNull(controller.takeCurrent())
+        assertEquals("poll", controller.endCurrent()?.pendingValue)
+        assertNull(controller.endCurrent())
     }
 
     @Test
@@ -37,6 +37,7 @@ class PendingPollControllerTest {
 
         assertEquals("poll", controller.take(operationId))
         assertNull(controller.take(operationId))
+        assertTrue(controller.isActive(operationId))
     }
 
     @Test
@@ -45,7 +46,8 @@ class PendingPollControllerTest {
         val operationId = controller.begin("tag")!!
 
         assertEquals("tag", controller.take(operationId))
-        assertNull(controller.takeCurrent())
+        assertNull(controller.take(operationId))
+        assertTrue(controller.isActive(operationId))
     }
 
     @Test
@@ -54,7 +56,8 @@ class PendingPollControllerTest {
         val operationId = controller.begin("tag")!!
 
         assertEquals("tag", controller.take(operationId))
-        assertNull(controller.takeCurrent())
+        assertNull(controller.endCurrent()?.pendingValue)
+        assertNull(controller.endCurrent())
     }
 
     @Test
@@ -62,20 +65,20 @@ class PendingPollControllerTest {
         val controller = PendingPollController<String>()
         controller.begin("poll")
 
-        assertEquals("poll", controller.takeCurrent())
-        assertNull(controller.takeCurrent())
-        assertNull(controller.takeCurrent())
+        assertEquals("poll", controller.endCurrent()?.pendingValue)
+        assertNull(controller.endCurrent())
+        assertNull(controller.endCurrent())
     }
 
     @Test
     fun staleTimeoutCannotTakeNewPoll() {
         val controller = PendingPollController<String>()
         val oldOperationId = controller.begin("old")!!
-        assertEquals("old", controller.takeCurrent())
+        assertEquals("old", controller.endCurrent()?.pendingValue)
         val newOperationId = controller.begin("new")!!
 
-        assertNull(controller.take(oldOperationId))
-        assertEquals("new", controller.take(newOperationId))
+        assertNull(controller.end(oldOperationId))
+        assertEquals("new", controller.end(newOperationId)?.pendingValue)
     }
 
     @Test
@@ -83,6 +86,7 @@ class PendingPollControllerTest {
         val controller = PendingPollController<String>()
         val oldOperationId = controller.begin("old")!!
         assertEquals("old", controller.take(oldOperationId))
+        assertNull(controller.end(oldOperationId)?.pendingValue)
         val newOperationId = controller.begin("new")!!
 
         assertNull(controller.take(oldOperationId))
@@ -95,7 +99,7 @@ class PendingPollControllerTest {
 
         assertTrue(controller.begin("first") != null)
         assertNull(controller.begin("second"))
-        assertEquals("first", controller.takeCurrent())
+        assertEquals("first", controller.endCurrent()?.pendingValue)
     }
 
     @Test
@@ -103,8 +107,67 @@ class PendingPollControllerTest {
         val controller = PendingPollController<String>()
         controller.begin("poll")
 
-        assertEquals("poll", controller.takeCurrent())
-        assertNull(controller.takeCurrent())
+        assertEquals("poll", controller.endCurrent()?.pendingValue)
+        assertNull(controller.endCurrent())
+    }
+
+    @Test
+    fun successfulPollKeepsSessionActiveUntilFinish() {
+        val controller = PendingPollController<String>()
+        val operationId = controller.begin("poll")!!
+
+        assertEquals("poll", controller.take(operationId))
+        assertNull(controller.begin("new poll"))
+        assertNull(controller.endCurrent()?.pendingValue)
+        assertTrue(controller.begin("new poll") != null)
+    }
+
+    @Test
+    fun tagRemovalOnlyClearsMatchingSuppression() {
+        val controller = TagRedispatchSuppressionController()
+        var onTagRemoved: (() -> Unit)? = null
+        assertTrue(controller.install(1L) { listener ->
+            onTagRemoved = listener
+            true
+        })
+
+        assertTrue(controller.isOwnedBy(1L))
+        onTagRemoved!!()
+        assertTrue(!controller.isOwnedBy(1L))
+    }
+
+    @Test
+    fun staleTagRemovalCannotClearNewSuppression() {
+        val controller = TagRedispatchSuppressionController()
+        var oldTagRemoved: (() -> Unit)? = null
+        controller.install(1L) { listener ->
+            oldTagRemoved = listener
+            true
+        }
+        controller.install(2L) { true }
+
+        oldTagRemoved!!()
+        assertTrue(controller.isOwnedBy(2L))
+        assertTrue(controller.clear(2L))
+    }
+
+    @Test
+    fun rejectedIgnoreDoesNotKeepSuppressionOwnership() {
+        val controller = TagRedispatchSuppressionController()
+
+        assertTrue(!controller.install(1L) { false })
+
+        assertTrue(!controller.isOwnedBy(1L))
+    }
+
+    @Test
+    fun engineDetachCanClearSuppressionBookkeeping() {
+        val controller = TagRedispatchSuppressionController()
+        controller.install(1L) { true }
+
+        controller.clearCurrent()
+
+        assertTrue(!controller.isOwnedBy(1L))
     }
 
     @Test

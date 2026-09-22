@@ -60,6 +60,56 @@ plugin version; no lint finding points to the cancellation implementation.
 Actual Reader Mode behavior, tag discovery, and activity transitions still
 require an NFC-capable Android device.
 
+## Android post-read redispatch suppression
+
+Android restores its normal tag dispatch system after Reader Mode is disabled.
+If an NDEF URI tag remains in the NFC field, the platform can discover it again
+and show a browser, chooser, or NFC service notification even though the plugin
+only completed one poll.
+
+`poll()` now provides an opt-in
+`androidSuppressRedispatchUntilTagRemoved` parameter, which defaults to
+`false`. When enabled, the plugin retains the raw Android `Tag` and installs
+`NfcAdapter.ignore()` during `finish()`, after connected tag technologies are
+closed and before Reader Mode is disabled. Dart receives the successful poll
+result immediately and can complete NDEF or transceive operations before
+calling finish.
+
+`androidRedispatchDebounce` controls the required out-of-field interval and
+defaults to 500 ms. It is not a maximum suppression duration. Android provides
+no public API to explicitly cancel `ignore()`; suppression ends when the tag is
+removed for the debounce interval or when a different UID is discovered. The
+Android documentation also notes that random-UID tags cannot be ignored
+reliably. An `ignore()` return value of `false` is treated as a safe fallback:
+the tag has already left range, suppression ownership is cleared, Reader Mode
+is disabled, and finish succeeds normally.
+
+The active reader session retains its operation ID after the poll result is
+delivered, until finish, timeout, or detach ends the session. This both protects
+post-poll NDEF operations and rejects a second poll with the existing `429`
+contract. Tag-removal callbacks have separate operation ownership; a stale
+callback cannot clear a newer suppression or disable a newer reader session.
+All state transitions remain confined to the NFC handler thread.
+
+The fork's Android minimum SDK is 24, matching the API level where
+`NfcAdapter.ignore()` was introduced, so no lower-API fallback is required.
+The public option is ignored by iOS and Web.
+
+### Verification
+
+- Dart formatting and analysis: passed
+- Android ownership and suppression tests: 18 passed
+- AGP 8.13.0 legacy Kotlin tests and example debug build: passed
+- AGP 9.0.1 Built-in Kotlin with Kotlin 2.3.20 tests and AAR build: passed
+- `flutter build apk --debug`: passed
+
+The suppression tests cover successful post-read session ownership, concurrent
+poll rejection after tag discovery, matching and stale tag-removal callbacks,
+`ignore()` rejection fallback, and engine-detach bookkeeping. Existing finish,
+timeout, tag discovery, stale callback, cleanup ordering, and structured error
+contract tests remain in the same passing suite. Actual framework dispatch and
+tag-removal timing still require an NFC-capable Android device.
+
 ## iOS session ownership
 
 Each CoreNFC polling session receives an operation ID. Session invalidation,

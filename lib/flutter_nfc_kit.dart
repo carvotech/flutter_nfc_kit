@@ -362,6 +362,20 @@ class FlutterNfcKit {
   ///
   /// See [Android NfcAdapter documentation](https://developer.android.com/reference/android/nfc/NfcAdapter#enableReaderMode(android.app.Activity,%20android.nfc.NfcAdapter.ReaderCallback,%20int,%20android.os.Bundle))
   /// for all available flags.
+  ///
+  /// Set [androidSuppressRedispatchUntilTagRemoved] to prevent Android's normal
+  /// tag dispatch system from handling the same tag after [finish] disables
+  /// Reader Mode. This is useful for NDEF URI tags that would otherwise show a
+  /// system link notification while they remain in the NFC field. Suppression
+  /// is installed by [finish], after tag technologies have been closed, so it
+  /// does not interfere with [readNDEFRecords], [transceive], or other work in
+  /// the active session.
+  ///
+  /// [androidRedispatchDebounce] controls how long the tag must remain outside
+  /// the NFC field before Android considers it removed. Android may end the
+  /// suppression earlier when a tag with a different UID enters the field, and
+  /// the platform documents that tags with random UIDs cannot be suppressed
+  /// reliably. Both options are ignored outside Android.
   static Future<NFCTag> poll({
     Duration? timeout,
     bool androidPlatformSound = true,
@@ -376,7 +390,16 @@ class FlutterNfcKit {
     bool readIso15693 = true,
     bool probeWebUSBMagic = false,
     Duration? extraReaderPresenceCheckDelay,
+    bool androidSuppressRedispatchUntilTagRemoved = false,
+    Duration androidRedispatchDebounce = const Duration(milliseconds: 500),
   }) async {
+    if (androidRedispatchDebounce.isNegative) {
+      throw ArgumentError.value(
+        androidRedispatchDebounce,
+        'androidRedispatchDebounce',
+        'must not be negative',
+      );
+    }
     // use a bitmask for compact representation
     int technologies = 0x0;
     // hardcoded bits, corresponding to flags in android.nfc.NfcAdapter
@@ -397,6 +420,9 @@ class FlutterNfcKit {
       if (extraReaderPresenceCheckDelay != null)
         'extra_reader_presence_check_delay':
             extraReaderPresenceCheckDelay.inMilliseconds,
+      'android_suppress_redispatch_until_tag_removed':
+          androidSuppressRedispatchUntilTagRemoved,
+      'android_redispatch_debounce': androidRedispatchDebounce.inMilliseconds,
     });
     return NFCTag.fromJson(jsonDecode(data));
   }

@@ -40,12 +40,17 @@ class FlutterNfcKitPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
 
     companion object {
         private val TAG = FlutterNfcKitPlugin::class.java.name
+        private const val DEFAULT_REDISPATCH_DEBOUNCE_MS = 500
         private var activity: WeakReference<Activity> = WeakReference(null)
         private val pendingPoll = PendingPollController<Result>()
+        private val redispatchSuppression = TagRedispatchSuppressionController()
         private var pollingTimeout: PollingTimeout? = null
         private var tagTechnology: TagTechnology? = null
         private var ndefTechnology: Ndef? = null
         private var mifareInfo: MifareInfo? = null
+        private var polledTag: Tag? = null
+        private var suppressRedispatchOnFinish = false
+        private var redispatchDebounceMs = DEFAULT_REDISPATCH_DEBOUNCE_MS
 
         private lateinit var nfcHandlerThread: HandlerThread
         private lateinit var nfcHandler: Handler
@@ -275,7 +280,7 @@ class FlutterNfcKitPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
     override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
         methodChannel.setMethodCallHandler(null)
         eventChannel.setStreamHandler(null)
-        cancelPollOnDetach(activity.get())
+        cancelPollOnDetach(activity.get(), clearSuppressionAfterCleanup = true)
         nfcHandlerThread.quitSafely()
     }
 
@@ -337,16 +342,36 @@ class FlutterNfcKitPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
                 val technologies = call.argument<Int>("technologies")!!
                 val readerModeFlags = call.argument<Int>("readerModeFlags")
                 val extraPresenceDelay = call.argument<Int>("extra_reader_presence_check_delay")
+                val suppressRedispatch =
+                    call.argument<Boolean>("android_suppress_redispatch_until_tag_removed") ?: false
+                val redispatchDebounce =
+                    call.argument<Int>("android_redispatch_debounce")
+                        ?: DEFAULT_REDISPATCH_DEBOUNCE_MS
                 runOnNfcThread(result, "Poll") {
-                    pollTag(nfcAdapter, result, timeout, technologies, readerModeFlags, extraPresenceDelay)
+                    pollTag(
+                        nfcAdapter,
+                        result,
+                        timeout,
+                        technologies,
+                        readerModeFlags,
+                        extraPresenceDelay,
+                        suppressRedispatch,
+                        redispatchDebounce,
+                    )
                 }
             }
 
             "finish" -> {
                 val sessionActivity = activity.get()
                 runOnNfcThread(result, "Close tag") {
-                    completeCancellationAfterCleanup(takePendingPoll()) {
-                        cleanUpNfcSession(nfcAdapter, sessionActivity)
+                    val endedSession = endCurrentPoll()
+                    completeCancellationAfterCleanup(endedSession?.pendingValue) {
+                        cleanUpNfcSession(
+                            nfcAdapter,
+                            sessionActivity,
+                            endedSession?.operationId,
+                            allowRedispatchSuppression = true,
+                        )
                     }
                     result.success("")
                 }
@@ -585,46 +610,77 @@ class FlutterNfcKitPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
         activity.clear()
     }
 
-    private fun pollTag(nfcAdapter: NfcAdapter, result: Result, timeout: Int, technologies: Int, readerModeFlags: Int?, extraReaderPresenceCheckDelay: Int?) {
+    private fun pollTag(
+        nfcAdapter: NfcAdapter,
+        result: Result,
+        timeout: Int,
+        technologies: Int,
+        readerModeFlags: Int?,
+        extraReaderPresenceCheckDelay: Int?,
+        suppressRedispatch: Boolean,
+        redispatchDebounce: Int,
+    ) {
+        require(redispatchDebounce >= 0) {
+            "androidRedispatchDebounce must not be negative"
+        }
+
         val operationId = pendingPoll.begin(result)
         if (operationId == null) {
             result.completeWith(PollErrors.alreadyInProgress)
             return
         }
 
+        polledTag = null
+        suppressRedispatchOnFinish = suppressRedispatch
+        redispatchDebounceMs = redispatchDebounce
+
         val pollingActivity = activity.get()
         if (pollingActivity == null) {
-            pendingPoll.take(operationId)?.error("500", "Cannot poll when not attached to activity", null)
+            pendingPoll.end(operationId)?.pendingValue?.error(
+                "500",
+                "Cannot poll when not attached to activity",
+                null,
+            )
+            clearSessionState()
             return
         }
 
         val timeoutRunnable = Runnable {
-            val pendingResult = pendingPoll.take(operationId) ?: return@Runnable
+            val endedSession = pendingPoll.end(operationId) ?: return@Runnable
             clearPollingTimeout(operationId)
             try {
-                nfcAdapter.disableReaderMode(pollingActivity)
+                cleanUpNfcSession(
+                    nfcAdapter,
+                    pollingActivity,
+                    operationId,
+                    allowRedispatchSuppression = false,
+                )
             } catch (ex: Exception) {
-                Log.w(TAG, "Cannot disable reader mode", ex)
+                Log.w(TAG, "Cannot clean up timed out NFC session", ex)
             }
-            pendingResult.completeWith(PollErrors.timedOut)
+            endedSession.pendingValue?.completeWith(PollErrors.timedOut)
         }
         pollingTimeout = PollingTimeout(operationId, timeoutRunnable)
         if (!nfcHandler.postDelayed(timeoutRunnable, timeout.toLong())) {
             pollingTimeout = null
-            pendingPoll.take(operationId)?.error(
+            pendingPoll.end(operationId)?.pendingValue?.error(
                 "500",
                 "Failed to schedule polling timeout",
                 null
             )
+            clearSessionState()
             return
         }
 
         val pollHandler = NfcAdapter.ReaderCallback { tag ->
             nfcHandler.post {
+                if (!pendingPoll.isActive(operationId)) return@post
                 val pendingResult = pendingPoll.take(operationId) ?: return@post
                 clearPollingTimeout(operationId)
                 try {
-                    pendingResult.success(parseTag(tag))
+                    val parsedTag = parseTag(tag)
+                    polledTag = tag
+                    pendingResult.success(parsedTag)
                 } catch (ex: Exception) {
                     completePollWithException(pendingResult, "Poll", ex)
                 }
@@ -647,7 +703,8 @@ class FlutterNfcKitPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
             nfcAdapter.enableReaderMode(pollingActivity, pollHandler, finalFlags, options)
         } catch (ex: Exception) {
             clearPollingTimeout(operationId)
-            pendingPoll.take(operationId)
+            pendingPoll.end(operationId)
+            clearSessionState()
             throw ex
         }
     }
@@ -659,13 +716,18 @@ class FlutterNfcKitPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
         pollingTimeout = null
     }
 
-    private fun takePendingPoll(): Result? {
-        val result = pendingPoll.takeCurrent() ?: return null
+    private fun endCurrentPoll(): PendingPollController.EndedSession<Result>? {
+        val session = pendingPoll.endCurrent() ?: return null
         clearPollingTimeout()
-        return result
+        return session
     }
 
-    private fun cleanUpNfcSession(nfcAdapter: NfcAdapter?, sessionActivity: Activity?) {
+    private fun cleanUpNfcSession(
+        nfcAdapter: NfcAdapter?,
+        sessionActivity: Activity?,
+        operationId: Long?,
+        allowRedispatchSuppression: Boolean,
+    ) {
         var failure: Exception? = null
         val tagTech = tagTechnology
         try {
@@ -679,6 +741,33 @@ class FlutterNfcKitPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
         } catch (ex: Exception) {
             if (failure == null) failure = ex
         }
+
+        val tagToSuppress = polledTag
+        if (
+            allowRedispatchSuppression &&
+            suppressRedispatchOnFinish &&
+            operationId != null &&
+            tagToSuppress != null &&
+            nfcAdapter != null
+        ) {
+            try {
+                val accepted = redispatchSuppression.install(operationId) { onTagRemoved ->
+                    nfcAdapter.ignore(
+                        tagToSuppress,
+                        redispatchDebounceMs,
+                        { onTagRemoved() },
+                        nfcHandler,
+                    )
+                }
+                if (!accepted) {
+                    Log.w(TAG, "Tag left range before redispatch suppression was installed")
+                }
+            } catch (ex: Exception) {
+                redispatchSuppression.clear(operationId)
+                if (failure == null) failure = ex
+            }
+        }
+
         tagTechnology = null
         ndefTechnology = null
         mifareInfo = null
@@ -689,18 +778,38 @@ class FlutterNfcKitPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
         } catch (ex: Exception) {
             if (failure == null) failure = ex
         }
+        clearSessionState()
         if (failure != null) throw failure
     }
 
-    private fun cancelPollOnDetach(detachedActivity: Activity?) {
+    private fun clearSessionState() {
+        polledTag = null
+        suppressRedispatchOnFinish = false
+        redispatchDebounceMs = DEFAULT_REDISPATCH_DEBOUNCE_MS
+    }
+
+    private fun cancelPollOnDetach(
+        detachedActivity: Activity?,
+        clearSuppressionAfterCleanup: Boolean = false,
+    ) {
         ensureNfcHandler()
         nfcHandler.post {
-            completeCancellationAfterCleanup(takePendingPoll()) {
+            val endedSession = endCurrentPoll()
+            completeCancellationAfterCleanup(endedSession?.pendingValue) {
                 try {
                     val adapter = detachedActivity?.let { getDefaultAdapter(it) }
-                    cleanUpNfcSession(adapter, detachedActivity)
+                    cleanUpNfcSession(
+                        adapter,
+                        detachedActivity,
+                        endedSession?.operationId,
+                        allowRedispatchSuppression = true,
+                    )
                 } catch (ex: Exception) {
                     Log.w(TAG, "Cannot clean up NFC session on activity detach", ex)
+                } finally {
+                    if (clearSuppressionAfterCleanup) {
+                        redispatchSuppression.clearCurrent()
+                    }
                 }
             }
         }

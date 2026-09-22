@@ -95,3 +95,27 @@ These flags are particularly useful for applications that:
 - Need fast tag detection (e.g., access control, fast payments)
 - Implement custom user feedback instead of system sounds
 - Use custom NDEF reading logic instead of automatic discovery
+
+### Suppress Android tag redispatch
+
+Android can dispatch an NDEF URI tag to the system again when Reader Mode is
+disabled while the tag is still in the NFC field. Opt in to suppression when
+that would cause an unwanted browser, chooser, or system notification:
+
+```dart
+final tag = await FlutterNfcKit.poll(
+  androidSuppressRedispatchUntilTagRemoved: true,
+);
+
+final records = await FlutterNfcKit.readNDEFRecords();
+// Process the tag, then finish as usual.
+await FlutterNfcKit.finish();
+```
+
+Suppression is installed by `finish()` after NFC technologies are closed and
+before Reader Mode is disabled, so reading and transceiving are unaffected. It
+uses Android's `NfcAdapter.ignore()` with a 500 ms removal debounce by default;
+customize this with `androidRedispatchDebounce`. Android may end suppression
+when a different UID enters the field, and tags with random UIDs cannot be
+suppressed reliably. The option defaults to `false` and has no effect on iOS or
+Web.
