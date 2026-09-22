@@ -34,8 +34,6 @@ import org.json.JSONObject
 import java.io.IOException
 import java.lang.ref.WeakReference
 import java.lang.reflect.InvocationTargetException
-import java.util.*
-import kotlin.concurrent.schedule
 
 
 class FlutterNfcKitPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
@@ -43,7 +41,8 @@ class FlutterNfcKitPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
     companion object {
         private val TAG = FlutterNfcKitPlugin::class.java.name
         private var activity: WeakReference<Activity> = WeakReference(null)
-        private var pollingTimeoutTask: TimerTask? = null
+        private val pendingPoll = PendingPollController<Result>()
+        private var pollingTimeout: PollingTimeout? = null
         private var tagTechnology: TagTechnology? = null
         private var ndefTechnology: Ndef? = null
         private var mifareInfo: MifareInfo? = null
@@ -53,6 +52,8 @@ class FlutterNfcKitPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
         private lateinit var methodChannel: MethodChannel
         private lateinit var eventChannel: EventChannel
         private var eventSink: EventSink? = null
+
+        private data class PollingTimeout(val operationId: Long, val runnable: Runnable)
 
         public fun handleTag(tag: Tag) {
             val result = parseTag(tag)
@@ -274,6 +275,7 @@ class FlutterNfcKitPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
     override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
         methodChannel.setMethodCallHandler(null)
         eventChannel.setStreamHandler(null)
+        cancelPollOnDetach(activity.get())
         nfcHandlerThread.quitSafely()
     }
 
@@ -290,7 +292,10 @@ class FlutterNfcKitPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
 
         val nfcAdapter = getDefaultAdapter(activity.get())
 
-        if (nfcAdapter?.isEnabled != true && call.method != "getNFCAvailability") {
+        if (nfcAdapter?.isEnabled != true &&
+            call.method != "getNFCAvailability" &&
+            call.method != "finish"
+        ) {
             result.error("404", "NFC not available", null)
             return
         }
@@ -338,18 +343,10 @@ class FlutterNfcKitPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
             }
 
             "finish" -> {
-                pollingTimeoutTask?.cancel()
+                val sessionActivity = activity.get()
                 runOnNfcThread(result, "Close tag") {
-                    val tagTech = tagTechnology
-                    if (tagTech != null && tagTech.isConnected) {
-                        tagTech.close()
-                    }
-                    val ndefTech = ndefTechnology
-                    if (ndefTech != null && ndefTech.isConnected) {
-                        ndefTech.close()
-                    }
-                    if (activity.get() != null) {
-                        nfcAdapter.disableReaderMode(activity.get())
+                    completeCancellationAfterCleanup(takePendingPoll()) {
+                        cleanUpNfcSession(nfcAdapter, sessionActivity)
                     }
                     result.success("")
                 }
@@ -575,35 +572,63 @@ class FlutterNfcKitPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
     }
 
     override fun onDetachedFromActivity() {
-        pollingTimeoutTask?.cancel()
-        pollingTimeoutTask = null
-        tagTechnology = null
-        ndefTechnology = null
+        cancelPollOnDetach(activity.get())
         activity.clear()
     }
 
-    override fun onReattachedToActivityForConfigChanges(binding: ActivityPluginBinding) {}
+    override fun onReattachedToActivityForConfigChanges(binding: ActivityPluginBinding) {
+        activity = WeakReference(binding.activity)
+    }
 
-    override fun onDetachedFromActivityForConfigChanges() {}
+    override fun onDetachedFromActivityForConfigChanges() {
+        cancelPollOnDetach(activity.get())
+        activity.clear()
+    }
 
     private fun pollTag(nfcAdapter: NfcAdapter, result: Result, timeout: Int, technologies: Int, readerModeFlags: Int?, extraReaderPresenceCheckDelay: Int?) {
-        pollingTimeoutTask = Timer().schedule(timeout.toLong()) {
-            try {
-                if (activity.get() != null) {
+        val operationId = pendingPoll.begin(result)
+        if (operationId == null) {
+            result.completeWith(PollErrors.alreadyInProgress)
+            return
+        }
 
-                    nfcAdapter.disableReaderMode(activity.get())
-                }
+        val pollingActivity = activity.get()
+        if (pollingActivity == null) {
+            pendingPoll.take(operationId)?.error("500", "Cannot poll when not attached to activity", null)
+            return
+        }
+
+        val timeoutRunnable = Runnable {
+            val pendingResult = pendingPoll.take(operationId) ?: return@Runnable
+            clearPollingTimeout(operationId)
+            try {
+                nfcAdapter.disableReaderMode(pollingActivity)
             } catch (ex: Exception) {
                 Log.w(TAG, "Cannot disable reader mode", ex)
             }
-            result.error("408", "Polling tag timeout", null)
+            pendingResult.completeWith(PollErrors.timedOut)
+        }
+        pollingTimeout = PollingTimeout(operationId, timeoutRunnable)
+        if (!nfcHandler.postDelayed(timeoutRunnable, timeout.toLong())) {
+            pollingTimeout = null
+            pendingPoll.take(operationId)?.error(
+                "500",
+                "Failed to schedule polling timeout",
+                null
+            )
+            return
         }
 
         val pollHandler = NfcAdapter.ReaderCallback { tag ->
-            pollingTimeoutTask?.cancel()
-
-            val jsonResult = parseTag(tag)
-            result.success(jsonResult)
+            nfcHandler.post {
+                val pendingResult = pendingPoll.take(operationId) ?: return@post
+                clearPollingTimeout(operationId)
+                try {
+                    pendingResult.success(parseTag(tag))
+                } catch (ex: Exception) {
+                    completePollWithException(pendingResult, "Poll", ex)
+                }
+            }
         }
 
         // Build final flags: combine technology flags with optional reader mode flags
@@ -618,7 +643,81 @@ class FlutterNfcKitPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
             options.putInt(EXTRA_READER_PRESENCE_CHECK_DELAY, extraReaderPresenceCheckDelay)
         }
 
-        nfcAdapter.enableReaderMode(activity.get(), pollHandler, finalFlags, options)
+        try {
+            nfcAdapter.enableReaderMode(pollingActivity, pollHandler, finalFlags, options)
+        } catch (ex: Exception) {
+            clearPollingTimeout(operationId)
+            pendingPoll.take(operationId)
+            throw ex
+        }
+    }
+
+    private fun clearPollingTimeout(operationId: Long? = null) {
+        val timeout = pollingTimeout ?: return
+        if (operationId != null && timeout.operationId != operationId) return
+        nfcHandler.removeCallbacks(timeout.runnable)
+        pollingTimeout = null
+    }
+
+    private fun takePendingPoll(): Result? {
+        val result = pendingPoll.takeCurrent() ?: return null
+        clearPollingTimeout()
+        return result
+    }
+
+    private fun cleanUpNfcSession(nfcAdapter: NfcAdapter?, sessionActivity: Activity?) {
+        var failure: Exception? = null
+        val tagTech = tagTechnology
+        try {
+            if (tagTech != null && tagTech.isConnected) tagTech.close()
+        } catch (ex: Exception) {
+            failure = ex
+        }
+        val ndefTech = ndefTechnology
+        try {
+            if (ndefTech != null && ndefTech.isConnected) ndefTech.close()
+        } catch (ex: Exception) {
+            if (failure == null) failure = ex
+        }
+        tagTechnology = null
+        ndefTechnology = null
+        mifareInfo = null
+        try {
+            if (nfcAdapter != null && sessionActivity != null) {
+                nfcAdapter.disableReaderMode(sessionActivity)
+            }
+        } catch (ex: Exception) {
+            if (failure == null) failure = ex
+        }
+        if (failure != null) throw failure
+    }
+
+    private fun cancelPollOnDetach(detachedActivity: Activity?) {
+        ensureNfcHandler()
+        nfcHandler.post {
+            completeCancellationAfterCleanup(takePendingPoll()) {
+                try {
+                    val adapter = detachedActivity?.let { getDefaultAdapter(it) }
+                    cleanUpNfcSession(adapter, detachedActivity)
+                } catch (ex: Exception) {
+                    Log.w(TAG, "Cannot clean up NFC session on activity detach", ex)
+                }
+            }
+        }
+    }
+
+    private fun completePollWithException(result: Result, desc: String, ex: Exception) {
+        Log.e(TAG, "$desc error", ex)
+        val excMessage = ex.localizedMessage
+        when (ex) {
+            is IOException -> result.error("500", "Communication error", excMessage)
+            is SecurityException -> result.error("503", "Tag already removed", excMessage)
+            is FormatException -> result.error("400", "NDEF format error", excMessage)
+            is InvocationTargetException -> result.error("500", "Communication error", excMessage)
+            is IllegalArgumentException -> result.error("400", "Command format error", excMessage)
+            is NoSuchMethodException -> result.error("405", "Transceive not supported for this type of card", excMessage)
+            else -> result.error("500", "Unhandled error", excMessage)
+        }
     }
 
     private class MethodResultWrapper(result: Result) : Result {
