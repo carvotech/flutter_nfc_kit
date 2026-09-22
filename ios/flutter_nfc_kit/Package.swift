@@ -14,9 +14,17 @@ let package = Package(
     dependencies: [],
     targets: [
         .target(
+            name: "flutter_nfc_kit_session",
+            dependencies: []
+        ),
+        .target(
             name: "flutter_nfc_kit",
-            dependencies: [],
+            dependencies: ["flutter_nfc_kit_session"],
             resources: []
+        ),
+        .testTarget(
+            name: "flutter_nfc_kit_sessionTests",
+            dependencies: ["flutter_nfc_kit_session"]
         )
     ]
 )

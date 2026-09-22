@@ -60,6 +60,45 @@ plugin version; no lint finding points to the cancellation implementation.
 Actual Reader Mode behavior, tag discovery, and activity transitions still
 require an NFC-capable Android device.
 
+## iOS session ownership
+
+Each CoreNFC polling session receives an operation ID. Session invalidation,
+tag detection, connection, NDEF status, FeliCa polling, and delayed multi-tag
+restart callbacks verify both the `NFCTagReaderSession` identity and operation
+ID before reading or completing state. A stale callback cannot complete or
+clear a later poll.
+
+Calling `finish()` marks the active operation as finishing and waits for the
+matching CoreNFC invalidation callback. The pending poll completes with `409`
+before `finish()` completes. Repeated finish calls share the same invalidation
+and all complete after it. Starting another poll before invalidation completes
+is rejected with `429`. Calling finish without an active session remains a
+successful no-op.
+
+The plugin publishes its instance to Flutter and implements engine detach
+cleanup. Detach invalidates the matching CoreNFC session, completes an active
+poll with `409`, completes any pending finish calls, and clears ownership before
+late invalidation callbacks can arrive.
+
+`iosRestartPolling()` no longer takes ownership of the pending poll result. It
+restarts the current non-finishing session and completes its own `Future<void>`
+immediately. Delayed restart work is ignored after finish or session rollover.
+
+The pure Swift ownership controller has XCTest coverage independent of Flutter
+and CoreNFC. The example application is also built for an unsigned iOS device
+to verify Flutter, CocoaPods, Swift Package, and CoreNFC integration. CoreNFC
+invalidation timing and real tag callbacks still require an NFC-capable iPhone.
+
+### Verification
+
+- Swift ownership controller build: passed
+- Swift ownership controller tests: 7 passed
+- `flutter build ios --debug --no-codesign`: passed
+- `dart analyze`: passed
+
+The controller tests cover exactly-once completion, finish after tag discovery,
+repeated finish, detach, concurrent begin rejection, and stale operation IDs.
+
 This patch supersedes the cancellation direction proposed in upstream
 [PR #142](https://github.com/nfcim/flutter_nfc_kit/pull/142). That PR uses a
 global callback without per-operation ownership and includes unrelated build,
@@ -68,5 +107,5 @@ platform, example, WebUSB, and SDK constraint changes.
 ## Removing this fork
 
 Consumers can return to an upstream release after it includes equivalent AGP
-9 Built-in Kotlin support and an Android polling cancellation implementation
-with per-operation ownership and stale-callback protection.
+9 Built-in Kotlin support and Android and iOS polling cancellation
+implementations with per-operation ownership and stale-callback protection.
